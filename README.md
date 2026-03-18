@@ -44,11 +44,11 @@ docker run -d -p 80:80 -e GATEWAY_HTTPS=0 gateway-server-v2
 
 ## AWS deployment
 
-For AWS (Route 53 private hosted zone), set `NGINX_RESOLVER` to your VPC DNS server. The VPC DNS is typically at the base of your VPC CIDR + 2 (e.g. `10.0.0.2` for `10.0.0.0/24`).
+For AWS with Route 53 zone `container-resolver-dns`, set `NGINX_PROVIDER=aws` so the gateway resolves `{hash}.workspace.internal.container-resolver-dns`:
 
 ```bash
 docker run -d -p 80:80 -p 443:443 \
-  -e NGINX_RESOLVER=10.0.0.2 \
+  -e NGINX_PROVIDER=aws \
   gateway-server-v2
 ```
 
@@ -58,5 +58,14 @@ Or with `aws.env.example`:
 docker run -d -p 80:80 -p 443:443 --env-file aws.env.example gateway-server-v2
 ```
 
-Deploy the gateway in the same VPC as your workspaces so it can resolve `*.workspace.internal`.
+**Direct nginx (no Docker):**
+
+```bash
+export NGINX_PROVIDER=aws
+export NGINX_WORKSPACE_DOMAIN="${NGINX_WORKSPACE_DOMAIN:-workspace.internal.container-resolver-dns}"
+envsubst '${NGINX_RESOLVER} ${NGINX_WORKSPACE_DOMAIN}' < nginx.conf > /tmp/nginx.conf
+# ... copy to /etc/nginx/ and start nginx
+```
+
+Override `NGINX_WORKSPACE_DOMAIN` if your zone uses a different suffix. Deploy the gateway in the same VPC as your workspaces.
 # gateway-service

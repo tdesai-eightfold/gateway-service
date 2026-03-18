@@ -1,10 +1,16 @@
 #!/bin/sh
 set -e
 
-# Resolver for *.workspace.internal DNS (OCI: 169.254.169.254; AWS VPC: VPC CIDR base+2, e.g. 10.0.0.2)
+# Resolver for DNS (OCI: 169.254.169.254; AWS: use system resolver or VPC DNS)
 export NGINX_RESOLVER="${NGINX_RESOLVER:-169.254.169.254}"
-envsubst '${NGINX_RESOLVER}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
-envsubst '${NGINX_RESOLVER}' < /etc/nginx/nginx-http-only.conf.template > /etc/nginx/nginx-http-only.conf
+# Workspace domain: OCI=workspace.internal; AWS with container-resolver-dns zone=workspace.internal.container-resolver-dns
+if [ "${NGINX_PROVIDER}" = "aws" ]; then
+    export NGINX_WORKSPACE_DOMAIN="${NGINX_WORKSPACE_DOMAIN:-workspace.internal.container-resolver-dns}"
+else
+    export NGINX_WORKSPACE_DOMAIN="${NGINX_WORKSPACE_DOMAIN:-workspace.internal}"
+fi
+envsubst '${NGINX_RESOLVER} ${NGINX_WORKSPACE_DOMAIN}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+envsubst '${NGINX_RESOLVER} ${NGINX_WORKSPACE_DOMAIN}' < /etc/nginx/nginx-http-only.conf.template > /etc/nginx/nginx-http-only.conf
 
 # Use HTTP only when TLS is terminated at external LB (e.g. OCI Load Balancer with ACM)
 if [ "${GATEWAY_HTTPS}" = "0" ]; then
