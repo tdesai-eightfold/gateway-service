@@ -10,10 +10,9 @@ COPY ssl/cert.pem ssl/key.pem /etc/nginx/ssl/
 COPY templates/index.html /usr/share/nginx/html/starter-template.html
 
 COPY nginx.conf /etc/nginx/nginx.conf.template
-COPY nginx-http-only.conf /etc/nginx/nginx-http-only.conf.template
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 80 443
+EXPOSE 443
 
 ENTRYPOINT ["/entrypoint.sh"]
