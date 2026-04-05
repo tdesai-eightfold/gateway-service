@@ -7,36 +7,37 @@ Environment
 OPENAI_API_KEY (required)
     Bearer token sent to api.openai.com.
 
-OPENAI_BASE_URL (optional)
-    Default: https://api.openai.com
+OPENAI_BASE_URL (optional)        Default: https://api.openai.com
+LISTEN_HOST (optional)            Default: 0.0.0.0
+LISTEN_PORT (optional)            Default: 1234
 
-LISTEN_HOST (optional)  Default: 0.0.0.0
-LISTEN_PORT (optional)  Default: 1234
+PROXY_BEARER_TOKEN (optional)
+    If set, client must send ``Authorization: Bearer <this value>``.
 
-Optional gate (Idea C)
-----------------------
-PROXY_BEARER_TOKEN
-    If set, the client must send ``Authorization: Bearer <this exact value>``.
-    Upstream still uses OPENAI_API_KEY.
+PROXY_TOKEN_MAP (optional)
+    Comma-separated ``client_token=sk-openai-key`` pairs. Overrides PROXY_BEARER_TOKEN.
 
-PROXY_TOKEN_MAP
-    Comma-separated ``client_token=sk-openai-key``. Client Bearer must match
-    ``client_token``; the mapped ``sk-...`` is used upstream. If set,
-    PROXY_BEARER_TOKEN is ignored.
+TOKEN_DB_PATH (optional)          Default: /tmp/token_usage.db
+IP_INPUT_TOKEN_LIMIT (optional)   Default: 100000
+IP_OUTPUT_TOKEN_LIMIT (optional)  Default: 100000
 
-If neither PROXY_BEARER_TOKEN nor PROXY_TOKEN_MAP is set, no client auth is
-required; upstream always uses OPENAI_API_KEY (suitable only on trusted networks).
+Admin endpoints
+---------------
+GET    /admin/usage        — per-IP token usage + configured limits
+DELETE /admin/usage/<ip>   — reset counters for one IP
 
 Run: pip install -r openai_proxy_requirements.txt && python openai_proxy.py
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import sys
+import threading
 from typing import Iterator
 
-import json
 import requests
 from flask import Flask, Response, abort, request, stream_with_context
 
@@ -46,6 +47,10 @@ OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com").rstrip
 UPSTREAM_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 PROXY_BEARER_TOKEN = os.environ.get("PROXY_BEARER_TOKEN", "").strip()
 PROXY_TOKEN_MAP_RAW = os.environ.get("PROXY_TOKEN_MAP", "").strip()
+
+TOKEN_DB_PATH = os.environ.get("TOKEN_DB_PATH", "/tmp/token_usage.db")
+IP_INPUT_TOKEN_LIMIT = int(os.environ.get("IP_INPUT_TOKEN_LIMIT", "100000"))
+IP_OUTPUT_TOKEN_LIMIT = int(os.environ.get("IP_OUTPUT_TOKEN_LIMIT", "100000"))
 
 HOP_HEADERS = frozenset(
     {
@@ -57,6 +62,79 @@ HOP_HEADERS = frozenset(
         "user-agent",
     }
 )
+
+FORCED_MODEL = "gpt-5.4-nano"
+
+# ── SQLite token store ────────────────────────────────────────────────────────
+
+_db_lock = threading.Lock()
+
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(TOKEN_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    with _db_lock, _get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ip_token_usage (
+                ip            TEXT PRIMARY KEY,
+                input_tokens  INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.commit()
+
+
+def _get_usage(ip: str) -> tuple[int, int]:
+    with _db_lock, _get_db() as conn:
+        row = conn.execute(
+            "SELECT input_tokens, output_tokens FROM ip_token_usage WHERE ip = ?",
+            (ip,),
+        ).fetchone()
+    return (row["input_tokens"], row["output_tokens"]) if row else (0, 0)
+
+
+def _record_usage(ip: str, input_delta: int, output_delta: int) -> None:
+    if input_delta == 0 and output_delta == 0:
+        return
+    with _db_lock, _get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO ip_token_usage (ip, input_tokens, output_tokens, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(ip) DO UPDATE SET
+                input_tokens  = input_tokens  + excluded.input_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
+                updated_at    = excluded.updated_at
+            """,
+            (ip, max(0, input_delta), max(0, output_delta)),
+        )
+        conn.commit()
+
+
+def _reset_usage(ip: str) -> bool:
+    with _db_lock, _get_db() as conn:
+        cur = conn.execute("DELETE FROM ip_token_usage WHERE ip = ?", (ip,))
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def _all_usage() -> list[dict]:
+    with _db_lock, _get_db() as conn:
+        rows = conn.execute(
+            "SELECT ip, input_tokens, output_tokens, updated_at "
+            "FROM ip_token_usage ORDER BY ip"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
 
 
 def _parse_token_map() -> dict[str, str]:
@@ -75,16 +153,12 @@ def _parse_token_map() -> dict[str, str]:
 _TOKEN_MAP = _parse_token_map()
 
 
-def resolve_upstream_authorization() -> str:
-    if not UPSTREAM_KEY and not _TOKEN_MAP:
-        abort(500, description="OPENAI_API_KEY is not set")
-
+def _resolve_upstream_auth() -> str:
     if _TOKEN_MAP:
         auth = request.headers.get("Authorization", "")
         if not auth.lower().startswith("bearer "):
             abort(401)
-        client = auth[7:].strip()
-        key = _TOKEN_MAP.get(client)
+        key = _TOKEN_MAP.get(auth[7:].strip())
         if not key:
             abort(401)
         return f"Bearer {key}"
@@ -93,12 +167,8 @@ def resolve_upstream_authorization() -> str:
         auth = request.headers.get("Authorization", "")
         if not auth.lower().startswith("bearer "):
             abort(401)
-        client = auth[7:].strip()
-        if client != PROXY_BEARER_TOKEN:
+        if auth[7:].strip() != PROXY_BEARER_TOKEN:
             abort(401)
-        if not UPSTREAM_KEY:
-            abort(500, description="OPENAI_API_KEY is not set")
-        return f"Bearer {UPSTREAM_KEY}"
 
     if not UPSTREAM_KEY:
         abort(500, description="OPENAI_API_KEY is not set")
@@ -106,37 +176,67 @@ def resolve_upstream_authorization() -> str:
 
 
 def _build_upstream_headers() -> dict[str, str]:
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() in HOP_HEADERS
-    }
-    headers["Authorization"] = resolve_upstream_authorization()
+    headers = {k: v for k, v in request.headers.items() if k.lower() in HOP_HEADERS}
+    headers["Authorization"] = _resolve_upstream_auth()
     return headers
 
 
-FORCED_MODEL = "gpt-5.4-nano"
+def _client_ip() -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _limit_response(kind: str, limit: int) -> Response:
+    return Response(
+        json.dumps(
+            {
+                "error": {
+                    "message": f"{kind} token limit ({limit:,}) reached for your IP.",
+                    "type": "rate_limit_error",
+                    "code": "token_limit_exceeded",
+                }
+            }
+        ),
+        status=429,
+        content_type="application/json",
+    )
+
+
+# ── Proxy route ───────────────────────────────────────────────────────────────
 
 
 @app.route("/v1/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def proxy_v1(subpath: str):
-    url = f"{OPENAI_BASE}/v1/{subpath}"
+    ip = _client_ip()
+
+    used_input, used_output = _get_usage(ip)
+    if used_input >= IP_INPUT_TOKEN_LIMIT:
+        return _limit_response("Input", IP_INPUT_TOKEN_LIMIT)
+    if used_output >= IP_OUTPUT_TOKEN_LIMIT:
+        return _limit_response("Output", IP_OUTPUT_TOKEN_LIMIT)
+
     headers = _build_upstream_headers()
 
-    # Force model to gpt-4o-mini for all requests that carry a model field
     raw = request.get_data()
+    is_streaming = False
     try:
         body = json.loads(raw)
-        if "model" in body:
-            body["model"] = FORCED_MODEL
+        body["model"] = FORCED_MODEL
+        if body.get("stream"):
+            is_streaming = True
+            # Inject stream_options for /v1/chat/completions to get exact token counts
+            if subpath == "chat/completions":
+                body["stream_options"] = {"include_usage": True}
         raw = json.dumps(body).encode()
     except Exception:
-        pass  # non-JSON body (e.g. multipart) — forward as-is
+        pass  # non-JSON body — forward as-is
 
     try:
         upstream = requests.request(
             method=request.method,
-            url=url,
+            url=f"{OPENAI_BASE}/v1/{subpath}",
             headers=headers,
             params=request.args,
             data=raw,
@@ -146,32 +246,109 @@ def proxy_v1(subpath: str):
     except requests.RequestException:
         abort(502, description="Upstream request failed")
 
-    def generate() -> Iterator[bytes]:
-        try:
-            for chunk in upstream.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        finally:
-            upstream.close()
-
-    out_headers = [
-        ("Cache-Control", "no-cache"),
-        ("X-Accel-Buffering", "no"),
-    ]
-    ct = upstream.headers.get("Content-Type")
+    out_headers = [("Cache-Control", "no-cache"), ("X-Accel-Buffering", "no")]
+    ct = upstream.headers.get("Content-Type", "")
     if ct:
         out_headers.append(("Content-Type", ct))
 
+    if is_streaming:
+        def generate_streaming() -> Iterator[bytes]:
+            """
+            Stream SSE to client. Buffers across chunk boundaries so large
+            events (e.g. response.completed) are never split mid-parse.
+
+            Supported token sources:
+              /v1/chat/completions — usage-only chunk: choices=[], usage={prompt_tokens, completion_tokens}
+              /v1/responses        — response.completed event: response.usage.{input_tokens, output_tokens}
+            """
+            line_buf = ""
+            try:
+                for chunk in upstream.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    line_buf += chunk.decode("utf-8", errors="ignore")
+                    parts = line_buf.split("\n")
+                    line_buf = parts[-1]
+                    complete_lines = parts[:-1]
+
+                    filtered: list[str] = []
+                    for line in complete_lines:
+                        stripped = line.strip()
+                        drop = False
+                        if stripped.startswith("data:") and stripped != "data: [DONE]":
+                            try:
+                                payload = json.loads(stripped[5:].strip())
+
+                                # /v1/chat/completions: usage-only final chunk
+                                usage = payload.get("usage")
+                                if usage and payload.get("choices") == []:
+                                    _record_usage(
+                                        ip,
+                                        usage.get("prompt_tokens", 0),
+                                        usage.get("completion_tokens", 0),
+                                    )
+                                    drop = True
+                            except Exception:
+                                pass
+                        if not drop:
+                            filtered.append(line + "\n")
+
+                    out = "".join(filtered)
+                    if out.strip():
+                        yield out.encode("utf-8")
+
+                if line_buf.strip():
+                    yield line_buf.encode("utf-8")
+            finally:
+                upstream.close()
+
+        return Response(
+            stream_with_context(generate_streaming()),
+            status=upstream.status_code,
+            headers=out_headers,
+        )
+
+    upstream.close()
+    abort(400, description="Non-streaming requests are not supported. Set stream=true.")
+
+
+# ── Admin endpoints ───────────────────────────────────────────────────────────
+
+
+@app.route("/admin/usage", methods=["GET"])
+def admin_usage():
     return Response(
-        stream_with_context(generate()),
-        status=upstream.status_code,
-        headers=out_headers,
+        json.dumps(
+            {
+                "limits": {
+                    "input_tokens": IP_INPUT_TOKEN_LIMIT,
+                    "output_tokens": IP_OUTPUT_TOKEN_LIMIT,
+                },
+                "usage": _all_usage(),
+            },
+            indent=2,
+        ),
+        content_type="application/json",
     )
+
+
+@app.route("/admin/usage/<path:ip>", methods=["DELETE"])
+def admin_reset_usage(ip: str):
+    if not _reset_usage(ip):
+        return Response(
+            json.dumps({"error": f"No record found for IP '{ip}'"}),
+            status=404,
+            content_type="application/json",
+        )
+    return Response(json.dumps({"ok": True, "reset": ip}), content_type="application/json")
 
 
 @app.route("/healthz")
 def healthz():
     return {"ok": True}, 200
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> None:
@@ -180,6 +357,7 @@ def main() -> None:
     if not UPSTREAM_KEY and not _TOKEN_MAP:
         print("error: set OPENAI_API_KEY or PROXY_TOKEN_MAP", file=sys.stderr)
         sys.exit(1)
+    _init_db()
     app.run(host=host, port=port, threaded=True)
 
 
