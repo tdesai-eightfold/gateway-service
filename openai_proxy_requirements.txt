@@ -1,2 +1,6 @@
 flask>=3.0,<4
 requests>=2.31,<3
+gunicorn>=21,<24
+gevent>=23,<25
+zope.event>=5,<6
+zope.interface>=6,<8
