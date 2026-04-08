@@ -6,8 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssl \
 # Pre-generated cert (ssl/cert.pem) - same cert for all deployments; users trust via ssl/cert.pem
 COPY ssl/cert.pem ssl/key.pem /etc/nginx/ssl/
 
-# Starter template picker at /<hash>/starter-template
-COPY templates/index.html /usr/share/nginx/html/starter-template.html
+# Bad gateway error page
+COPY templates/502.html /usr/share/nginx/html/502.html
 
 COPY nginx.conf /etc/nginx/nginx.conf.template
 COPY entrypoint.sh /entrypoint.sh
