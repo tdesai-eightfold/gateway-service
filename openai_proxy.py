@@ -23,8 +23,9 @@ IP_OUTPUT_TOKEN_LIMIT (optional)  Default: 100000
 
 Admin endpoints
 ---------------
-GET    /admin/usage        — per-IP token usage + configured limits
-DELETE /admin/usage/<ip>   — reset counters for one IP
+GET    /admin/usage              — per-IP token usage + configured limits
+DELETE /admin/usage/<ip>         — reset counters for one IP
+POST   /admin/usage/reset        — JSON body: ``{"ip": "<addr>"}`` or ``{"all": true}`` to clear all
 
 Run: pip install -r openai_proxy_requirements.txt && python openai_proxy.py
 """
@@ -123,6 +124,13 @@ def _reset_usage(ip: str) -> bool:
         cur = conn.execute("DELETE FROM ip_token_usage WHERE ip = ?", (ip,))
         conn.commit()
     return cur.rowcount > 0
+
+
+def _reset_all_usage() -> int:
+    with _db_lock, _get_db() as conn:
+        cur = conn.execute("DELETE FROM ip_token_usage")
+        conn.commit()
+    return cur.rowcount
 
 
 def _all_usage() -> list[dict]:
@@ -334,6 +342,42 @@ def admin_usage():
 
 @app.route("/admin/usage/<path:ip>", methods=["DELETE"])
 def admin_reset_usage(ip: str):
+    if not _reset_usage(ip):
+        return Response(
+            json.dumps({"error": f"No record found for IP '{ip}'"}),
+            status=404,
+            content_type="application/json",
+        )
+    return Response(json.dumps({"ok": True, "reset": ip}), content_type="application/json")
+
+
+@app.route("/admin/usage/reset", methods=["POST"])
+def admin_reset_usage_post():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return Response(
+            json.dumps({"error": "Expected JSON object body"}),
+            status=400,
+            content_type="application/json",
+        )
+    if payload.get("all") is True:
+        cleared = _reset_all_usage()
+        return Response(
+            json.dumps({"ok": True, "cleared_rows": cleared}),
+            content_type="application/json",
+        )
+    ip = payload.get("ip")
+    if not ip or not isinstance(ip, str):
+        return Response(
+            json.dumps(
+                {
+                    "error": 'Send {"ip": "<address>"} or {"all": true}',
+                }
+            ),
+            status=400,
+            content_type="application/json",
+        )
+    ip = ip.strip()
     if not _reset_usage(ip):
         return Response(
             json.dumps({"error": f"No record found for IP '{ip}'"}),
