@@ -8,6 +8,8 @@ OPENAI_API_KEY (required)
     Bearer token sent to api.openai.com.
 
 OPENAI_BASE_URL (optional)        Default: https://api.openai.com
+ALLOWED_MODELS                    Hard-coded allow-list: gpt-5.3-codex, gpt-5.4-mini
+                                  Requests with any other model are rejected with HTTP 400.
 LISTEN_HOST (optional)            Default: 0.0.0.0
 LISTEN_PORT (optional)            Default: 1234
 
@@ -64,7 +66,7 @@ HOP_HEADERS = frozenset(
     }
 )
 
-FORCED_MODEL = "gpt-5.4-nano"
+ALLOWED_MODELS: frozenset[str] = frozenset({"gpt-5.3-codex", "gpt-5.4-mini"})
 
 # ── SQLite token store ────────────────────────────────────────────────────────
 
@@ -231,7 +233,24 @@ def proxy_v1(subpath: str):
     is_streaming = False
     try:
         body = json.loads(raw)
-        body["model"] = FORCED_MODEL
+        requested_model = body.get("model", "")
+        if requested_model not in ALLOWED_MODELS:
+            return Response(
+                json.dumps(
+                    {
+                        "error": {
+                            "message": (
+                                f"Model '{requested_model}' is not allowed. "
+                                f"Allowed models: {sorted(ALLOWED_MODELS)}"
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "model_not_allowed",
+                        }
+                    }
+                ),
+                status=400,
+                content_type="application/json",
+            )
         if body.get("stream"):
             is_streaming = True
             # Inject stream_options for /v1/chat/completions to get exact token counts
