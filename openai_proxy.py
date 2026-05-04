@@ -84,39 +84,47 @@ def _init_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ip_token_usage (
-                ip            TEXT PRIMARY KEY,
+                ip            TEXT NOT NULL,
+                model         TEXT NOT NULL DEFAULT '',
                 input_tokens  INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
-                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+                updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (ip, model)
             )
             """
         )
+        # Best-effort migration for pre-existing DBs without the model column.
+        try:
+            conn.execute("ALTER TABLE ip_token_usage ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
-def _get_usage(ip: str) -> tuple[int, int]:
+def _get_usage(ip: str, model: str) -> tuple[int, int]:
     with _db_lock, _get_db() as conn:
         row = conn.execute(
-            "SELECT input_tokens, output_tokens FROM ip_token_usage WHERE ip = ?",
-            (ip,),
+            "SELECT input_tokens, output_tokens FROM ip_token_usage "
+            "WHERE ip = ? AND model = ?",
+            (ip, model),
         ).fetchone()
     return (row["input_tokens"], row["output_tokens"]) if row else (0, 0)
 
 
-def _record_usage(ip: str, input_delta: int, output_delta: int) -> None:
+def _record_usage(ip: str, model: str, input_delta: int, output_delta: int) -> None:
     if input_delta == 0 and output_delta == 0:
         return
     with _db_lock, _get_db() as conn:
         conn.execute(
             """
-            INSERT INTO ip_token_usage (ip, input_tokens, output_tokens, updated_at)
-            VALUES (?, ?, ?, datetime('now'))
-            ON CONFLICT(ip) DO UPDATE SET
+            INSERT INTO ip_token_usage (ip, model, input_tokens, output_tokens, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(ip, model) DO UPDATE SET
                 input_tokens  = input_tokens  + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
                 updated_at    = excluded.updated_at
             """,
-            (ip, max(0, input_delta), max(0, output_delta)),
+            (ip, model, max(0, input_delta), max(0, output_delta)),
         )
         conn.commit()
 
@@ -220,17 +228,11 @@ def _limit_response(kind: str, limit: int) -> Response:
 @app.route("/v1/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def proxy_v1(subpath: str):
     ip = _client_ip()
-
-    used_input, used_output = _get_usage(ip)
-    if used_input >= IP_INPUT_TOKEN_LIMIT:
-        return _limit_response("Input", IP_INPUT_TOKEN_LIMIT)
-    if used_output >= IP_OUTPUT_TOKEN_LIMIT:
-        return _limit_response("Output", IP_OUTPUT_TOKEN_LIMIT)
-
     headers = _build_upstream_headers()
 
     raw = request.get_data()
     is_streaming = False
+    requested_model = ""
     try:
         body = json.loads(raw)
         requested_model = body.get("model", "")
@@ -259,6 +261,12 @@ def proxy_v1(subpath: str):
         raw = json.dumps(body).encode()
     except Exception:
         pass  # non-JSON body — forward as-is
+
+    used_input, used_output = _get_usage(ip, requested_model)
+    if used_input >= IP_INPUT_TOKEN_LIMIT:
+        return _limit_response("Input", IP_INPUT_TOKEN_LIMIT)
+    if used_output >= IP_OUTPUT_TOKEN_LIMIT:
+        return _limit_response("Output", IP_OUTPUT_TOKEN_LIMIT)
 
     try:
         upstream = requests.request(
@@ -311,10 +319,24 @@ def proxy_v1(subpath: str):
                                 if usage and payload.get("choices") == []:
                                     _record_usage(
                                         ip,
+                                        requested_model,
                                         usage.get("prompt_tokens", 0),
                                         usage.get("completion_tokens", 0),
                                     )
                                     drop = True
+
+                                # /v1/responses: response.completed event
+                                if payload.get("type") == "response.completed":
+                                    response_usage = (
+                                        payload.get("response", {}).get("usage") or {}
+                                    )
+                                    if response_usage:
+                                        _record_usage(
+                                            ip,
+                                            requested_model,
+                                            response_usage.get("input_tokens", 0),
+                                            response_usage.get("output_tokens", 0),
+                                        )
                             except Exception:
                                 pass
                         if not drop:
@@ -340,6 +362,31 @@ def proxy_v1(subpath: str):
 
 
 # ── Admin endpoints ───────────────────────────────────────────────────────────
+
+
+@app.route("/usage", methods=["GET"])
+def get_usage_for_ip():
+    ip = _client_ip()
+    with _db_lock, _get_db() as conn:
+        rows = conn.execute(
+            "SELECT model, input_tokens, output_tokens, updated_at "
+            "FROM ip_token_usage WHERE ip = ? ORDER BY model",
+            (ip,),
+        ).fetchall()
+    return Response(
+        json.dumps(
+            {
+                "ip": ip,
+                "limits": {
+                    "input_tokens": IP_INPUT_TOKEN_LIMIT,
+                    "output_tokens": IP_OUTPUT_TOKEN_LIMIT,
+                },
+                "models": [dict(r) for r in rows],
+            },
+            indent=2,
+        ),
+        content_type="application/json",
+    )
 
 
 @app.route("/admin/usage", methods=["GET"])
