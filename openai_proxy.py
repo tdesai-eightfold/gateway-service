@@ -364,20 +364,22 @@ def proxy_v1(subpath: str):
                                     )
                                     response_usage = raw_usage or {}
                                     if response_usage:
-                                        _record_usage(
-                                            ip,
-                                            requested_model,
-                                            response_usage.get("input_tokens", 0),
-                                            response_usage.get("output_tokens", 0),
-                                        )
+                                        in_tok = response_usage.get("input_tokens", 0)
+                                        out_tok = response_usage.get("output_tokens", 0)
                                         app.logger.info(
-                                            "RECORDED responses ip=%s model=%s in=%s out=%s",
-                                            ip, requested_model,
-                                            response_usage.get("input_tokens", 0),
-                                            response_usage.get("output_tokens", 0),
+                                            "ABOUT-TO-RECORD ip=%s model=%s in=%s out=%s",
+                                            ip, requested_model, in_tok, out_tok,
                                         )
-                            except Exception:
-                                pass
+                                        try:
+                                            _record_usage(ip, requested_model, in_tok, out_tok)
+                                            app.logger.info(
+                                                "RECORDED responses ip=%s model=%s in=%s out=%s",
+                                                ip, requested_model, in_tok, out_tok,
+                                            )
+                                        except Exception as exc:
+                                            app.logger.exception("RECORD-FAILED: %s", exc)
+                            except Exception as exc:
+                                app.logger.exception("SSE-PARSE-FAILED: %s", exc)
                         if not drop:
                             filtered.append(line + "\n")
 
