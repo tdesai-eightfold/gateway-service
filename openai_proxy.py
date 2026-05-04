@@ -356,6 +356,11 @@ def proxy_v1(subpath: str):
 
                                 # /v1/responses: response.completed event
                                 if payload.get("type") == "response.completed":
+                                    app.logger.info(
+                                        "RESPONSE-COMPLETED-DUMP keys=%s response_keys=%s",
+                                        list(payload.keys()),
+                                        list((payload.get("response") or {}).keys()),
+                                    )
                                     response_usage = (
                                         payload.get("response", {}).get("usage") or {}
                                     )
