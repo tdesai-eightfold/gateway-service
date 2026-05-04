@@ -35,7 +35,6 @@ Run: pip install -r openai_proxy_requirements.txt && python openai_proxy.py
 from __future__ import annotations
 
 import json
-import logging
 import os
 import sqlite3
 import sys
@@ -45,13 +44,7 @@ from typing import Iterator
 import requests
 from flask import Flask, Response, abort, request, stream_with_context
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-
 app = Flask(__name__)
-app.logger.setLevel(logging.INFO)
 
 OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
 UPSTREAM_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -269,11 +262,6 @@ def proxy_v1(subpath: str):
     except Exception:
         pass  # non-JSON body — forward as-is
 
-    app.logger.info(
-        "PROXY ip=%s subpath=%s model=%s streaming=%s body_bytes=%d",
-        ip, subpath, requested_model, is_streaming, len(raw),
-    )
-
     used_input, used_output = _get_usage(ip, requested_model)
     if used_input >= IP_INPUT_TOKEN_LIMIT:
         return _limit_response("Input", IP_INPUT_TOKEN_LIMIT)
@@ -325,17 +313,6 @@ def proxy_v1(subpath: str):
                         if stripped.startswith("data:") and stripped != "data: [DONE]":
                             try:
                                 payload = json.loads(stripped[5:].strip())
-                                event_type = payload.get("type")
-                                if "usage" in payload or (
-                                    event_type and event_type.startswith("response.")
-                                ):
-                                    app.logger.info(
-                                        "SSE-EVENT subpath=%s type=%s has_usage=%s choices=%s",
-                                        subpath,
-                                        event_type,
-                                        bool(payload.get("usage")),
-                                        payload.get("choices"),
-                                    )
 
                                 # /v1/chat/completions: usage-only final chunk
                                 usage = payload.get("usage")
@@ -346,40 +323,22 @@ def proxy_v1(subpath: str):
                                         usage.get("prompt_tokens", 0),
                                         usage.get("completion_tokens", 0),
                                     )
-                                    app.logger.info(
-                                        "RECORDED chat ip=%s model=%s in=%s out=%s",
-                                        ip, requested_model,
-                                        usage.get("prompt_tokens", 0),
-                                        usage.get("completion_tokens", 0),
-                                    )
                                     drop = True
 
                                 # /v1/responses: response.completed event
                                 if payload.get("type") == "response.completed":
-                                    raw_usage = (payload.get("response") or {}).get("usage")
-                                    app.logger.info(
-                                        "RESPONSE-COMPLETED-DUMP usage_value=%r status=%s",
-                                        raw_usage,
-                                        (payload.get("response") or {}).get("status"),
+                                    response_usage = (
+                                        payload.get("response", {}).get("usage") or {}
                                     )
-                                    response_usage = raw_usage or {}
                                     if response_usage:
-                                        in_tok = response_usage.get("input_tokens", 0)
-                                        out_tok = response_usage.get("output_tokens", 0)
-                                        app.logger.info(
-                                            "ABOUT-TO-RECORD ip=%s model=%s in=%s out=%s",
-                                            ip, requested_model, in_tok, out_tok,
+                                        _record_usage(
+                                            ip,
+                                            requested_model,
+                                            response_usage.get("input_tokens", 0),
+                                            response_usage.get("output_tokens", 0),
                                         )
-                                        try:
-                                            _record_usage(ip, requested_model, in_tok, out_tok)
-                                            app.logger.info(
-                                                "RECORDED responses ip=%s model=%s in=%s out=%s",
-                                                ip, requested_model, in_tok, out_tok,
-                                            )
-                                        except Exception as exc:
-                                            app.logger.exception("RECORD-FAILED: %s", exc)
-                            except Exception as exc:
-                                app.logger.exception("SSE-PARSE-FAILED: %s", exc)
+                            except Exception:
+                                pass
                         if not drop:
                             filtered.append(line + "\n")
 
@@ -405,8 +364,9 @@ def proxy_v1(subpath: str):
 # ── Admin endpoints ───────────────────────────────────────────────────────────
 
 
-@app.route("/usage/<path:ip>", methods=["GET"])
-def get_usage_for_ip(ip: str):
+@app.route("/usage", methods=["GET"])
+def get_usage_for_ip():
+    ip = _client_ip()
     with _db_lock, _get_db() as conn:
         rows = conn.execute(
             "SELECT model, input_tokens, output_tokens, updated_at "
