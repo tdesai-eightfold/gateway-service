@@ -356,14 +356,13 @@ def proxy_v1(subpath: str):
 
                                 # /v1/responses: response.completed event
                                 if payload.get("type") == "response.completed":
+                                    raw_usage = (payload.get("response") or {}).get("usage")
                                     app.logger.info(
-                                        "RESPONSE-COMPLETED-DUMP keys=%s response_keys=%s",
-                                        list(payload.keys()),
-                                        list((payload.get("response") or {}).keys()),
+                                        "RESPONSE-COMPLETED-DUMP usage_value=%r status=%s",
+                                        raw_usage,
+                                        (payload.get("response") or {}).get("status"),
                                     )
-                                    response_usage = (
-                                        payload.get("response", {}).get("usage") or {}
-                                    )
+                                    response_usage = raw_usage or {}
                                     if response_usage:
                                         _record_usage(
                                             ip,
