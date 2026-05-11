@@ -66,7 +66,7 @@ HOP_HEADERS = frozenset(
     }
 )
 
-ALLOWED_MODELS: frozenset[str] = frozenset({"gpt-5.3-codex", "gpt-5.4-mini"})
+ALLOWED_MODELS: frozenset[str] = frozenset({"gpt-4o"})
 
 # ── SQLite token store ────────────────────────────────────────────────────────
 
