@@ -52,8 +52,8 @@ PROXY_BEARER_TOKEN = os.environ.get("PROXY_BEARER_TOKEN", "").strip()
 PROXY_TOKEN_MAP_RAW = os.environ.get("PROXY_TOKEN_MAP", "").strip()
 
 TOKEN_DB_PATH = os.environ.get("TOKEN_DB_PATH", "/tmp/token_usage.db")
-IP_INPUT_TOKEN_LIMIT = int(os.environ.get("IP_INPUT_TOKEN_LIMIT", "100000"))
-IP_OUTPUT_TOKEN_LIMIT = int(os.environ.get("IP_OUTPUT_TOKEN_LIMIT", "100000"))
+IP_INPUT_TOKEN_LIMIT = int(os.environ.get("IP_INPUT_TOKEN_LIMIT", "1000000"))
+IP_OUTPUT_TOKEN_LIMIT = int(os.environ.get("IP_OUTPUT_TOKEN_LIMIT", "1000000"))
 
 HOP_HEADERS = frozenset(
     {
