@@ -317,10 +317,14 @@ def proxy_v1(subpath: str):
                                 # /v1/chat/completions: usage-only final chunk
                                 usage = payload.get("usage")
                                 if usage and payload.get("choices") == []:
+                                    prompt_tokens = usage.get("prompt_tokens", 0)
+                                    cached_tokens = (
+                                        usage.get("prompt_tokens_details") or {}
+                                    ).get("cached_tokens", 0)
                                     _record_usage(
                                         ip,
                                         requested_model,
-                                        usage.get("prompt_tokens", 0),
+                                        prompt_tokens - cached_tokens,
                                         usage.get("completion_tokens", 0),
                                     )
                                     drop = True
@@ -331,10 +335,17 @@ def proxy_v1(subpath: str):
                                         payload.get("response", {}).get("usage") or {}
                                     )
                                     if response_usage:
+                                        input_tokens = response_usage.get(
+                                            "input_tokens", 0
+                                        )
+                                        cached_tokens = (
+                                            response_usage.get("input_tokens_details")
+                                            or {}
+                                        ).get("cached_tokens", 0)
                                         _record_usage(
                                             ip,
                                             requested_model,
-                                            response_usage.get("input_tokens", 0),
+                                            input_tokens - cached_tokens,
                                             response_usage.get("output_tokens", 0),
                                         )
                             except Exception:
